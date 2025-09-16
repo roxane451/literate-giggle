@@ -1,0 +1,295 @@
+stages:
+  - build
+  - deploy-dev
+  - deploy-qa
+  - deploy-staging
+  - deploy-prod
+
+variables:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_CLI_TIMEOUT: "300"
+  KUBECTL_VERSION: v1.28.2
+  HELM_VERSION: v3.13.1
+  FF_SCRIPT_SECTIONS: "true"
+  SCRIPT_TIMEOUT: "30m"
+  AFTER_SCRIPT_TIMEOUT: "5m"
+
+# Template de build - Push vers DockerHub
+.build_and_push:
+  stage: build
+  tags:
+    - shell
+  before_script:
+    - 'echo "Connexion à DockerHub"'
+    - 'echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin docker.io'
+  script:
+    - 'echo "Building $DOCKER_IMAGE:$CI_COMMIT_SHA"'
+    - 'docker build --platform linux/amd64 -t $DOCKER_IMAGE:$CI_COMMIT_SHA -f $DOCKERFILE $SERVICE_DIR'
+    - 'docker tag $DOCKER_IMAGE:$CI_COMMIT_SHA $DOCKER_IMAGE:latest'
+    - 'docker push $DOCKER_IMAGE:$CI_COMMIT_SHA'
+    - 'docker push $DOCKER_IMAGE:latest'
+    - 'echo "Images pushed successfully"'
+  after_script:
+    - 'docker rmi $DOCKER_IMAGE:$CI_COMMIT_SHA $DOCKER_IMAGE:latest || true'
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+  timeout: 20 minutes
+
+# Template de déploiement Kubernetes
+.deploy_template:
+  tags:
+    - shell
+  timeout: 15 minutes
+  variables:
+    HELM_TIMEOUT: "300s"  # 5 minutes
+    KUBECTL_TIMEOUT: "180s"  # 3 minutes
+  before_script:
+    - 'echo "=== VÉRIFICATION DES OUTILS ==="'
+    - 'kubectl version --client || exit 1'
+    - 'helm version || exit 1'
+    - 'echo "=== CONFIGURATION CLUSTER ==="'
+    - 'kubectl config get-contexts'
+    - 'kubectl config use-context roxane451/literate-giggle-gitlab:literate-giggle'
+    - 'echo "=== TEST CONNEXION CLUSTER ==="'
+    - 'kubectl cluster-info --request-timeout=30s'
+    - 'kubectl get nodes --request-timeout=30s || echo "Pas de nodes visibles"'
+    - 'echo "Connexion cluster OK"'
+  environment:
+    name: $ENVIRONMENT
+    url: http://$ENVIRONMENT.literate-giggle.local
+  script:
+    - 'echo "DÉPLOIEMENT $ENVIRONMENT - DÉMARRAGE"'
+    # CORRECTION VERROU HELM
+    - 'echo "Libération du verrou Helm $ENVIRONMENT..."'
+    - 'kubectl create namespace $ENVIRONMENT --dry-run=client -o yaml | kubectl apply -f - || echo "Namespace existe"'
+    - 'kubectl delete secret -n $ENVIRONMENT -l owner=helm,name=$RELEASE_NAME --ignore-not-found=true'
+    - 'helm uninstall $RELEASE_NAME --namespace $ENVIRONMENT --ignore-not-found --timeout=60s || echo "Pas de release à désinstaller"'
+    - 'sleep 5'
+    #  Nettoyage des ressources
+    - 'echo "Nettoyage des ressources $ENVIRONMENT..."'
+    - 'kubectl delete deployment -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=60s'
+    - 'kubectl delete service -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=30s'
+    - 'kubectl delete pods -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=60s --force'
+    - 'sleep 5'
+    #  Secret DockerHub
+    - 'echo "Configuration secret DockerHub $ENVIRONMENT..."'
+    - 'kubectl delete secret dockerhub-secret -n $ENVIRONMENT --ignore-not-found=true'
+    - 'kubectl create secret docker-registry dockerhub-secret
+        --docker-server=docker.io
+        --docker-username="$DOCKER_USERNAME"
+        --docker-password="$DOCKER_PASSWORD"
+        --docker-email="$DOCKER_EMAIL"
+        --namespace=$ENVIRONMENT'
+    #  Déploiement Helm
+    - 'echo "Déploiement Helm $ENVIRONMENT..."'
+    - |
+      helm install $RELEASE_NAME ./k8s/helm \
+        --namespace $ENVIRONMENT \
+        --values ./k8s/helm/values.yaml \
+        --set services.gateway.image.repository=$DOCKER_USERNAME/literate-giggle-gateway \
+        --set services.gateway.image.tag=$CI_COMMIT_SHA \
+        --set services.orders.image.repository=$DOCKER_USERNAME/literate-giggle-orders \
+        --set services.orders.image.tag=$CI_COMMIT_SHA \
+        --set services.users.image.repository=$DOCKER_USERNAME/literate-giggle-users \
+        --set services.users.image.tag=$CI_COMMIT_SHA \
+        --set global.imagePullSecrets[0].name=dockerhub-secret \
+        --timeout=$HELM_TIMEOUT \
+        --debug
+    # Vérification
+    - 'echo "Vérification $ENVIRONMENT..."'
+    - 'kubectl get pods -n $ENVIRONMENT --request-timeout=30s'
+    - 'kubectl get services -n $ENVIRONMENT --request-timeout=30s'
+    - 'echo "DÉPLOIEMENT $ENVIRONMENT TERMINÉ"'
+  retry:
+    max: 1
+    when: runner_system_failure
+  needs:
+    - build-gateway
+    - build-orders
+    - build-users
+
+# Template de déblocage Helm
+.unlock_helm_template:
+  tags:
+    - shell
+  timeout: 5 minutes
+  script:
+    - 'echo "DÉBLOCAGE MANUEL HELM $ENVIRONMENT"'
+    - 'kubectl config use-context roxane451/literate-giggle-gitlab:literate-giggle'
+    - 'kubectl create namespace $ENVIRONMENT --dry-run=client -o yaml | kubectl apply -f - || echo "Namespace existe"'
+    - 'kubectl delete secret -n $ENVIRONMENT -l owner=helm --ignore-not-found=true'
+    - 'helm uninstall $RELEASE_NAME --namespace $ENVIRONMENT --ignore-not-found || echo "Pas de release"'
+    - 'kubectl delete all -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true'
+    - 'echo "Helm $ENVIRONMENT débloqué"'
+  rules:
+    - when: manual
+  allow_failure: true
+
+# Jobs de build
+build-gateway:
+  extends: .build_and_push
+  variables:
+    DOCKER_IMAGE: $DOCKER_USERNAME/literate-giggle-gateway
+    DOCKERFILE: gateway/Dockerfile
+    SERVICE_DIR: gateway
+
+build-orders:
+  extends: .build_and_push
+  variables:
+    DOCKER_IMAGE: $DOCKER_USERNAME/literate-giggle-orders
+    DOCKERFILE: orders/Dockerfile
+    SERVICE_DIR: orders
+
+build-users:
+  extends: .build_and_push
+  variables:
+    DOCKER_IMAGE: $DOCKER_USERNAME/literate-giggle-users
+    DOCKERFILE: users/Dockerfile
+    SERVICE_DIR: users
+
+# Déploiements
+deploy-dev:
+  extends: .deploy_template
+  stage: deploy-dev
+  variables:
+    ENVIRONMENT: dev
+    RELEASE_NAME: literate-giggle-dev
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+deploy-qa:
+  extends: .deploy_template
+  stage: deploy-qa
+  variables:
+    ENVIRONMENT: qa
+    RELEASE_NAME: literate-giggle-qa
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+
+deploy-staging:
+  extends: .deploy_template
+  stage: deploy-staging
+  variables:
+    ENVIRONMENT: staging
+    RELEASE_NAME: literate-giggle-staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+deploy-prod:
+  extends: .deploy_template
+  stage: deploy-prod
+  timeout: 20 minutes
+  variables:
+    ENVIRONMENT: prod
+    RELEASE_NAME: literate-giggle-prod
+    HELM_TIMEOUT: "600s"
+  script:
+    - 'echo "DÉPLOIEMENT PRODUCTION - CRITIQUE"'
+    # Vérifications préalables PRODUCTION
+    - 'echo "Vérifications préalables PRODUCTION..."'
+    - 'kubectl get nodes --request-timeout=60s'
+    - 'kubectl top nodes --request-timeout=60s || echo "Metrics non disponibles"'
+    # CORRECTION VERROU HELM
+    - 'echo "Libération du verrou Helm PRODUCTION..."'
+    - 'kubectl create namespace $ENVIRONMENT --dry-run=client -o yaml | kubectl apply -f - || echo "Namespace existe"'
+    - 'echo "État actuel PRODUCTION:"'
+    - 'helm list -n prod || echo "Aucune release active"'
+    - 'kubectl get pods -n prod --request-timeout=30s || echo "Aucun pod"'
+    - 'kubectl delete secret -n $ENVIRONMENT -l owner=helm,name=$RELEASE_NAME --ignore-not-found=true'
+    - 'helm uninstall $RELEASE_NAME --namespace $ENVIRONMENT --ignore-not-found --timeout=120s || echo "Pas de release à désinstaller"'
+    - 'sleep 10'
+    # Nettoyage des ressources
+    - 'echo "Nettoyage des ressources PRODUCTION..."'
+    - 'kubectl delete deployment -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=120s'
+    - 'kubectl delete service -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=60s'
+    - 'kubectl delete pods -l app.kubernetes.io/instance=$RELEASE_NAME -n $ENVIRONMENT --ignore-not-found=true --timeout=120s --force'
+    - 'sleep 10'
+    # Secret DockerHub
+    - 'echo "Configuration secret DockerHub PRODUCTION..."'
+    - 'kubectl delete secret dockerhub-secret -n $ENVIRONMENT --ignore-not-found=true'
+    - 'kubectl create secret docker-registry dockerhub-secret
+        --docker-server=docker.io
+        --docker-username="$DOCKER_USERNAME"
+        --docker-password="$DOCKER_PASSWORD"
+        --docker-email="$DOCKER_EMAIL"
+        --namespace=$ENVIRONMENT'
+    # Déploiement Helm
+    - 'echo "Lancement déploiement Helm PRODUCTION..."'
+    - |
+      helm install $RELEASE_NAME ./k8s/helm \
+        --namespace $ENVIRONMENT \
+        --values ./k8s/helm/values.yaml \
+        --set services.gateway.image.repository=$DOCKER_USERNAME/literate-giggle-gateway \
+        --set services.gateway.image.tag=$CI_COMMIT_SHA \
+        --set services.orders.image.repository=$DOCKER_USERNAME/literate-giggle-orders \
+        --set services.orders.image.tag=$CI_COMMIT_SHA \
+        --set services.users.image.repository=$DOCKER_USERNAME/literate-giggle-users \
+        --set services.users.image.tag=$CI_COMMIT_SHA \
+        --set global.imagePullSecrets[0].name=dockerhub-secret \
+        --timeout=$HELM_TIMEOUT \
+        --debug
+    # Vérification approfondie
+    - 'echo "Vérification santé PRODUCTION"'
+    - 'kubectl get pods -n $ENVIRONMENT --request-timeout=30s'
+    - 'kubectl get services -n $ENVIRONMENT --request-timeout=30s'
+    - 'kubectl get ingress -n $ENVIRONMENT --request-timeout=30s || echo "Aucun ingress"'
+    - 'helm list -n $ENVIRONMENT'
+    - 'echo "PRODUCTION DÉPLOYÉE AVEC SUCCÈS!"'
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: true
+
+# Jobs de déblocage Helm
+unlock-helm-dev:
+  extends: .unlock_helm_template
+  stage: deploy-dev
+  variables:
+    ENVIRONMENT: dev
+    RELEASE_NAME: literate-giggle-dev
+
+unlock-helm-qa:
+  extends: .unlock_helm_template
+  stage: deploy-qa
+  variables:
+    ENVIRONMENT: qa
+    RELEASE_NAME: literate-giggle-qa
+
+unlock-helm-staging:
+  extends: .unlock_helm_template
+  stage: deploy-staging
+  variables:
+    ENVIRONMENT: staging
+    RELEASE_NAME: literate-giggle-staging
+
+unlock-helm-prod:
+  extends: .unlock_helm_template
+  stage: deploy-prod
+  variables:
+    ENVIRONMENT: prod
+    RELEASE_NAME: literate-giggle-prod
+
+# Job de nettoyage Docker
+cleanup-old-images:
+  stage: deploy-prod
+  timeout: 15 minutes
+  tags:
+    - shell
+  before_script:
+    - 'echo "Connexion à Docker Hub..."'
+    - 'echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin docker.io'
+  script:
+    - 'echo "Nettoyage des images Docker anciennes..."'
+    - 'docker image prune -af --filter "until=168h"'
+    - 'docker volume prune -f'
+    - 'docker builder prune -af'
+    - 'echo "Nettoyage terminé"'
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: true

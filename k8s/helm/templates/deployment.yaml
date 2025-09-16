@@ -1,0 +1,119 @@
+# Boucle sur chaque service défini dans Values.services
+{{- range $service, $config := .Values.services }}
+# Vérifie si le service est activé
+{{- if $config.enabled | default true }}
+---
+# Définition d'un déploiement Kubernetes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $.Release.Name }}-{{ $service }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    # Labels standardisés pour identifier l'application et son instance
+    app.kubernetes.io/name: {{ $service }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $service }}
+spec:
+  # Nombre de réplicas du pod
+  replicas: {{ $config.replicaCount | default 1 }}
+  selector:
+    # Sélecteur pour associer les pods au déploiement
+    matchLabels:
+      app.kubernetes.io/name: {{ $service }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      # Labels appliqués aux pods pour identification
+      labels:
+        app.kubernetes.io/name: {{ $service }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        app.kubernetes.io/component: {{ $service }}
+    spec:
+      # Gestion des secrets
+      {{- if $.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml $.Values.global.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      containers:
+      # Définition du conteneur pour le service
+      - name: {{ $service }}
+        # Image Docker utilisée
+        image: "{{ $config.image.repository }}:{{ $config.image.tag | default "latest" }}"
+        imagePullPolicy: {{ $config.image.pullPolicy | default "IfNotPresent" }}
+        command: ["uvicorn"]
+        args: 
+          - "main:app" # Point d'entrée de l'app FastAPI
+          - "--host"   
+          - "0.0.0.0"
+          - "--port"  
+          - "{{ $config.port }}"
+          - "--log-level"
+          - "info"
+        ports:
+        # Exposition du port du conteneur
+        - containerPort: {{ $config.port }}
+          name: http
+          protocol: TCP
+        env:
+        # Variables d'environnement pour le conteneur
+        - name: PORT
+          value: "{{ $config.port }}" # Port du service
+        - name: NODE_ENV
+          value: "production" 
+        - name: SERVICE_NAME
+          value: "{{ $service }}"
+        # Variables spécifiques pour le service gateway
+        {{- if eq $service "gateway" }}
+        - name: USERS_SERVICE_URL
+          # URL interne pour le service "users"
+          value: "http://{{ $.Release.Name }}-users:{{ $.Values.services.users.service.port | default $.Values.services.users.port }}"
+        - name: ORDERS_SERVICE_URL
+          # URL interne pour le service "orders"
+          value: "http://{{ $.Release.Name }}-orders:{{ $.Values.services.orders.service.port | default $.Values.services.orders.port }}"
+        {{- end }}
+        # Ajout de variables d'environnement supplémentaires si définies
+        {{- if $config.additionalEnv }}
+        {{- toYaml $config.additionalEnv | nindent 8 }}
+        {{- end }}
+        # Configuration des ressources (CPU, mémoire)
+        {{- if $config.resources }}
+        resources:
+          {{- toYaml $config.resources | nindent 10 }}
+        {{- end }}
+        # Health checks (vérifications de santé)
+        {{- if $config.livenessProbe }}
+        livenessProbe:
+          # Configuration pour vérifier si le conteneur est en vie
+          {{- toYaml $config.livenessProbe | nindent 10 }}
+        {{- end }}
+        {{- if $config.readinessProbe }}
+        readinessProbe:
+          # Configuration pour vérifier si le conteneur est prêt à recevoir du trafic
+          {{- toYaml $config.readinessProbe | nindent 10 }}
+        {{- end }}
+---
+# Définition du service Kubernetes pour exposer le déploiement
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-{{ $service }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    # Labels pour identifier le service
+    app.kubernetes.io/name: {{ $service }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: {{ $service }}
+spec:
+  type: {{ $config.service.type | default "ClusterIP" }}
+  ports:
+  - port: {{ $config.service.port | default $config.port }}
+    targetPort: http
+    protocol: TCP
+    name: http
+  selector:
+    # Sélection des pods associés au service
+    app.kubernetes.io/name: {{ $service }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+{{- end }}
+{{- end }}

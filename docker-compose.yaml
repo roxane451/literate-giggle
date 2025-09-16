@@ -1,0 +1,52 @@
+version: '3.7'
+
+services:
+    gateway:
+        image: roxane451/literate-giggle-gateway:latest
+        command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--log-level", "debug"]
+        build:
+            context: ./gateway
+            dockerfile: Dockerfile
+        env_file:
+            - ./gateway/.env
+        ports:
+          - "8001:8080"  # Port externe:Port interne
+        depends_on:
+          - users
+          - orders
+        volumes:
+          - ./gateway:/app
+        environment:
+          - PORT=8080
+          - USERS_SERVICE_URL=http://users:8081
+          - ORDERS_SERVICE_URL=http://orders:8082
+
+    users:
+        image: roxane451/literate-giggle-users:latest
+        command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081", "--log-level", "debug"]
+        build:
+            context: ./users
+            dockerfile: Dockerfile
+        env_file:
+            - ./users/.env
+        ports:
+          - "8002:8081"  # Exposé pour debug/test
+        volumes:
+          - ./users:/app
+        environment:
+          - PORT=8081
+
+    orders:
+        image: roxane451/literate-giggle-orders:latest
+        command: ["uvicorn", "main:app", "--reload", "--host", "0.0.0.0", "--port", "8082", "--log-level", "debug"]
+        build:
+            context: ./orders
+            dockerfile: Dockerfile
+        env_file:
+            - ./orders/.env
+        ports:
+          - "8003:8082"  # Exposé pour debug/test
+        volumes:
+          - ./orders:/app
+        environment:
+          - PORT=8082

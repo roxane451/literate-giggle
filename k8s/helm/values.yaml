@@ -1,0 +1,75 @@
+global:
+  imagePullSecrets:
+    - name: dockerhub-secret
+  namespace: default
+
+services:
+  gateway:
+    enabled: true
+    image:
+      repository: roxane451/literate-giggle-gateway
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8080
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 8080
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    # Commande explicite pour garder le processus vivant
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+    livenessProbe: {}
+    readinessProbe: {}
+
+  orders:
+    enabled: true
+    image:
+      repository: roxane451/literate-giggle-orders
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8081
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 8081
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8081"]
+    livenessProbe: {}
+    readinessProbe: {}
+
+  users:
+    enabled: true
+    image:
+      repository: roxane451/literate-giggle-users
+      tag: latest
+      pullPolicy: IfNotPresent
+    port: 8082
+    replicaCount: 1
+    service:
+      type: ClusterIP
+      port: 8082
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8082"]
+    livenessProbe: {}
+    readinessProbe: {}
+
+ingress:
+  enabled: false

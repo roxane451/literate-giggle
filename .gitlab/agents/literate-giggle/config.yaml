@@ -1,0 +1,11 @@
+gitops:
+  manifest_projects:
+  - id: roxane451/literate-giggle-gitlab
+
+ci_access:
+  projects:
+  - id: roxane451/literate-giggle-gitlab
+    default_namespace: default
+  groups:
+  - id: roxane451
+    default_namespace: default
